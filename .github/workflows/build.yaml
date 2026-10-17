@@ -1,0 +1,389 @@
+# The platform's builder (spec/plugins-are-shared-through-registries
+# requirements 13, 14, 19 and 20; item 102; plan Q1, Q4, Q5; rulings 135 and
+# 136).
+#
+# A TEMPLATE, kept in meridian-platform, for the public repository
+# `open-meridian/plugin-builder` (approved 2026-10-16, ruling 143; created by
+# the product owner at deploy time). It is copied there as
+# .github/workflows/build.yaml. Nothing here runs in this repository: this
+# path is outside .github/workflows on purpose.
+#
+# Two jobs, so the publisher's code never reaches the signing key (SLSA
+# Build L3; ruling 136):
+#
+# - `build` checks out the commit the tag pins, verifies the tag's SSH
+#   signature against the organisation's keys active now (SigningKeyStatus),
+#   builds on plugin-python, scans with Trivy (bill of materials,
+#   vulnerabilities, secrets) and ClamAV (malware), runs the role's
+#   conformance suite and measures the image. The publisher's Dockerfile runs
+#   here, so this job holds no id-token and cannot push: its permissions are
+#   contents: read alone. It hands the image and its findings on as
+#   artifacts.
+# - `sign` never checks out or runs the publisher's code. It tells the
+#   platform the build has begun (RecordBuildStarted, with the public log),
+#   loads the image tarball, enforces the 1 GiB cap, pushes by digest,
+#   attaches the provenance, the image's metadata, the bill of materials and
+#   the scans as OCI referrers signed with the platform's KMS key (cosign,
+#   Workload Identity Federation), holds the build job's output to plan Q4's
+#   policy as one BuildFinding per check, and hands the platform the digest
+#   and those findings (RecordBuildResults). It is the only job with
+#   id-token: write, and runs in the GitHub environment `signing`, so its
+#   OIDC subject is `repo:open-meridian/plugin-builder:environment:signing`.
+#
+# DESIGN25's RecordBuildResultsRequest carries the image's digest and the
+# findings alone. The platform reads the rest from the image's referrers by
+# digest: the provenance (`https://slsa.dev/provenance/v1`, naming the
+# repository, commit, tag, signer and builder) and the image's metadata
+# (`<NAME?:https://open-meridian.dev/attestation/plugin-metadata/v1>`: its
+# PluginMetadata, the contract version it declares, and the documentation's
+# texts). The scan policy is the builder's: a secret, malware, a CISA KEV
+# entry or a fixable critical blocks; any other vulnerability warns; strong
+# copyleft in the bill of materials warns, for counsel. The base images and
+# community's licence come from the platform, as inputs.
+#
+# The KMS key's Workload Identity Federation is pinned to that job: its
+# attribute condition requires
+#   assertion.sub == 'repo:open-meridian/plugin-builder:environment:signing'
+#   && assertion.job_workflow_ref ==
+#      'open-meridian/plugin-builder/.github/workflows/build.yaml@refs/heads/main'
+# and grants roles/cloudkms.signerVerifier on the one key and nothing else.
+# The platform's intake takes results only with that job's token: GitHub's
+# issuer, the platform's audience, this repository, this workflow at
+# refs/heads/main, and the build's one-time nonce (ruling 135).
+#
+# Started only by the platform (workflow_dispatch through the GitHub App, on
+# a publish request). The platform decides; the builder reports. Community
+# build logs are public.
+#
+# Before the repository is created: pin every action and image below to a
+# commit SHA or digest (the project's SHA-pin rule; tags are written here only
+# as placeholders), create the `signing` environment limited to the main
+# branch, and set the repository variables.
+#
+# DESIGN25 seams, marked SEAM below: `meridian plugin check --json` and the
+# conformance command's exact invocation and output, which v25's CLI and SDK
+# define.
+
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id: {description: "The platform's build ID", required: true}
+      repository: {description: "owner/name, linked through the App", required: true}
+      tag: {description: "vX.Y.Z, signed", required: true}
+      listing: {description: "organisation/plugin", required: true}
+      registry: {description: "community or verified", required: true}
+      image: {description: "Where the copy is pushed, without tag or digest", required: true}
+      intake_url: {description: "Where results go; {build_id} is filled in", required: true}
+      intake_nonce: {description: "The build's one-time nonce", required: true}
+      base_images: {description: "The images a plugin may be built on, comma-separated", required: true}
+      community_licence: {description: "Community's licence for a plugin's own code", required: true}
+
+# Nothing by default; each job says what it holds.
+permissions: {}
+
+concurrency:
+  group: build-${{ inputs.build_id }}
+  cancel-in-progress: false
+
+env:
+  SIZE_CAP_BYTES: "1073741824"
+  PLATFORM: ${{ vars.PLATFORM_URL }}               # https://open-meridian.com
+  TRIVY_IMAGE: aquasec/trivy:0.56.2@sha256:26245f364b6f5d223003dc344ec1eb5eb8439052bfecb31d79aeba0c74344b3a
+  CLAMAV_IMAGE: clamav/clamav:1.4@sha256:b5b910ce43d595bf8a2fe401e34db56434602b2c755b7c2b07f00c917d04d469
+  KEV_URL: https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json
+  METADATA_TYPE: https://open-meridian.dev/attestation/plugin-metadata/v1
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    # The publisher's code runs in this job: no id-token, no packages, no
+    # secrets. It can read, build and report, and nothing else.
+    permissions:
+      contents: read
+    outputs:
+      commit: ${{ steps.tag.outputs.commit }}
+      verified: ${{ steps.tag.outputs.verified }}
+      fingerprint: ${{ steps.tag.outputs.fingerprint }}
+      private: ${{ steps.repo.outputs.private }}
+      licence: ${{ steps.repo.outputs.licence }}
+      base: ${{ steps.build.outputs.base }}
+      size: ${{ steps.build.outputs.size }}
+    steps:
+      - name: Check out the commit the tag pins
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
+          path: src
+          persist-credentials: false
+
+      - name: Verify the tag's signature against the organisation's keys
+        id: tag
+        run: |
+          org="${{ inputs.listing }}"; org="${org%%/*}"
+          # meridian.v1.SigningKeyStatus: issued_at_ns, keys, signature.
+          curl -fsS "${PLATFORM}/api/v1/registry/signing-keys" -o status.json
+          # Active keys only: not_trusted_after_ns 0, or later than now.
+          jq -r --arg org "$org" --argjson now "$(date -u +%s)000000000" '
+            .keys[] | select(.organisation == $org)
+            | select(.not_trusted_after_ns == 0 or .not_trusted_after_ns > $now)
+            | "builder@open-meridian \(.public_key)"' status.json > allowed_signers
+          cd src
+          commit="$(git rev-parse "${{ inputs.tag }}^{commit}")"
+          if out="$(git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=../allowed_signers \
+                verify-tag "${{ inputs.tag }}" 2>&1)"; then verified=true; else verified=false; fi
+          echo "$out"
+          fp="$(printf '%s' "$out" | grep -o 'SHA256:[A-Za-z0-9+/]*' | head -1 || true)"
+          echo "commit=${commit}" >> "$GITHUB_OUTPUT"
+          echo "verified=${verified}" >> "$GITHUB_OUTPUT"
+          echo "fingerprint=${fp}" >> "$GITHUB_OUTPUT"
+
+      - name: The repository's visibility and licence
+        id: repo
+        run: |
+          curl -fsS "https://api.github.com/repos/${{ inputs.repository }}" > repo.json
+          echo "private=$(jq -r .private repo.json)" >> "$GITHUB_OUTPUT"
+          echo "licence=$(jq -r '.license.spdx_id // ""' repo.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Plugin check (pre-flight, metadata, documentation, role pages)
+        # SEAM: the CLI's JSON output of `meridian plugin check`, v25's CLI:
+        # passed, detail, metadata (PluginMetadata), schema_version (v<N>),
+        # documentation [{name, title, text, digest}], role_pages {passed, detail}.
+        run: |
+          curl -fsSL "${PLATFORM}/install" | sh
+          (cd src && meridian plugin check --json) > check.json || true
+          jq -e . check.json >/dev/null || echo '{}' > check.json
+
+      - name: Build on plugin-python
+        id: build
+        run: |
+          base="$(grep -m1 -iE '^FROM ' src/Dockerfile | awk '{print $2}')"
+          echo "base=${base}" >> "$GITHUB_OUTPUT"
+          docker build --pull -t candidate:local src
+          size="$(docker image inspect candidate:local --format '{{.Size}}')"
+          echo "size=${size}" >> "$GITHUB_OUTPUT"
+          docker save candidate:local -o image.tar
+          docker create --name fs candidate:local >/dev/null && docker export fs -o rootfs.tar
+
+      - name: Bill of materials, vulnerabilities and secrets (Trivy)
+        run: |
+          docker run --rm -v "$PWD:/w" "${TRIVY_IMAGE}" image --input /w/image.tar \
+            --format spdx-json --output /w/sbom.spdx.json
+          docker run --rm -v "$PWD:/w" "${TRIVY_IMAGE}" image --input /w/image.tar \
+            --scanners vuln,secret --format json --output /w/trivy.json
+
+      - name: Malware (ClamAV)
+        run: |
+          mkdir rootfs && tar -xf rootfs.tar -C rootfs
+          docker run --rm -v "$PWD/rootfs:/scan:ro" "${CLAMAV_IMAGE}" \
+            sh -c 'freshclam --quiet; clamscan -r --infected --no-summary /scan' > clamav.txt || true
+
+      - name: The role's conformance suite on the harness
+        # SEAM: the SDK's conformance invocation and its result, v25's SDK.
+        run: |
+          (cd src && meridian plugin conformance --image candidate:local --json) > conformance.json \
+            || echo '{"passed": false, "detail": "the conformance suite did not run"}' > conformance.json
+
+      - name: Hand the image and findings to the signing job
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: build-${{ inputs.build_id }}
+          retention-days: 1
+          if-no-files-found: ignore
+          path: |
+            image.tar
+            sbom.spdx.json
+            trivy.json
+            clamav.txt
+            check.json
+            conformance.json
+
+  sign:
+    needs: build
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # The only job that reaches the KMS key or the platform. It runs none of
+    # the publisher's code: it loads an image tarball and pushes it.
+    environment: signing
+    permissions:
+      contents: read
+      packages: write   # community copies, ghcr.io/open-meridian/plugins/...
+      id-token: write   # the platform's intake token, and KMS via WIF
+    env:
+      AUDIENCE: ${{ vars.PLATFORM_OIDC_AUDIENCE }}  # open-meridian-registry
+      KMS_KEY: ${{ vars.KMS_KEY }}                  # gcpkms://projects/.../cryptoKeyVersions/1
+    steps:
+      - name: Tell the platform the build has begun (RecordBuildStarted)
+        run: |
+          token="$(curl -fsS -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" | jq -r .value)"
+          echo "::add-mask::${token}"
+          echo "::add-mask::${{ inputs.intake_nonce }}"
+          url="${{ inputs.intake_url }}"; url="${url/\{build_id\}/${{ inputs.build_id }}}"
+          jq -n --arg build_id "${{ inputs.build_id }}" --arg intake_nonce "${{ inputs.intake_nonce }}" \
+            --arg log_url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            '{build_id: $build_id, intake_nonce: $intake_nonce, log_url: $log_url}' \
+          | curl -fsS -X POST -H "Authorization: Bearer ${token}" \
+              -H 'Content-Type: application/json' --data @- "${url%/results}/started"
+
+      - name: The build's image and findings
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: build-${{ inputs.build_id }}
+        continue-on-error: true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac  # v3
+
+      - name: Authenticate to the KMS key (Workload Identity Federation)
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed  # v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.SIGNER_SERVICE_ACCOUNT }}
+
+      - name: Push by digest, within the size cap
+        id: push
+        run: |
+          if [ ! -s image.tar ] || [ "${{ needs.build.outputs.size || 0 }}" -gt "${SIZE_CAP_BYTES}" ]; then
+            echo "no image, or over the 1 GiB cap: nothing is pushed"
+            echo "digest=" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          docker load -i image.tar
+          if [ "${{ inputs.registry }}" = "community" ]; then
+            echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          else
+            gcloud auth configure-docker "${{ inputs.image }}" --quiet  # verified, Phase 2
+          fi
+          ref="${{ inputs.image }}:${{ inputs.tag }}"
+          docker tag candidate:local "$ref" && docker push "$ref"
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$ref" | cut -d@ -f2)"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Provenance and metadata, signed with the platform's KMS key
+        if: steps.push.outputs.digest != ''
+        run: |
+          image="${{ inputs.image }}@${{ steps.push.outputs.digest }}"
+          [ -s check.json ] || echo '{}' > check.json
+          jq -n --arg repo "${{ inputs.repository }}" --arg commit "${{ needs.build.outputs.commit }}" \
+            --arg tag "${{ inputs.tag }}" --arg signer "${{ needs.build.outputs.fingerprint }}" \
+            --arg builder "${GITHUB_REPOSITORY}" \
+            --arg run "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" '{
+              buildDefinition: {buildType: "https://open-meridian.dev/plugin-builder/v1",
+                externalParameters: {repository: $repo, tag: $tag},
+                resolvedDependencies: [{uri: ("git+https://github.com/" + $repo), digest: {gitCommit: $commit}}]},
+              runDetails: {builder: {id: ("https://github.com/" + $builder)},
+                metadata: {invocationId: $run}},
+              repository: $repo, commit: $commit, tag: $tag, signer: $signer, builder: $builder}' \
+            > provenance.json
+          jq '{metadata: (.metadata // {}), schema_version: (.schema_version // ""),
+               documentation: [(.documentation // [])[] | {name, title, text, digest}]}' \
+            check.json > metadata.json
+          # OCI 1.1 referrers of the image, which the platform reads by digest.
+          export COSIGN_EXPERIMENTAL=1
+          cosign attest --yes --tlog-upload=false --registry-referrers-mode=oci-1-1 \
+            --key "${KMS_KEY}" --type slsaprovenance1 --predicate provenance.json "$image"
+          cosign attest --yes --tlog-upload=false --registry-referrers-mode=oci-1-1 \
+            --key "${KMS_KEY}" --type "${METADATA_TYPE}" --predicate metadata.json "$image"
+          cosign attest --yes --tlog-upload=false --registry-referrers-mode=oci-1-1 \
+            --key "${KMS_KEY}" --type spdxjson --predicate sbom.spdx.json "$image"
+          cosign attest --yes --tlog-upload=false --registry-referrers-mode=oci-1-1 \
+            --key "${KMS_KEY}" --type vuln --predicate trivy.json "$image"
+
+      - name: Findings, one per check, under plan Q4's policy
+        run: |
+          [ -s sbom.spdx.json ] || echo '{}' > sbom.spdx.json
+          [ -s trivy.json ] || echo '{}' > trivy.json
+          [ -s check.json ] || echo '{}' > check.json
+          [ -s conformance.json ] || echo '{"passed": false}' > conformance.json
+          touch clamav.txt
+          # CISA's KEV catalogue; unread, every vulnerability found blocks.
+          curl -fsS "${KEV_URL}" | jq '[.vulnerabilities[].cveID]' > kev.json || echo 'null' > kev.json
+          jq -n \
+            --arg registry "${{ inputs.registry }}" \
+            --argjson verified "${{ needs.build.outputs.verified || 'false' }}" \
+            --arg signer "${{ needs.build.outputs.fingerprint }}" \
+            --argjson private "${{ needs.build.outputs.private || 'true' }}" \
+            --arg licence "${{ needs.build.outputs.licence }}" \
+            --arg wanted "${{ inputs.community_licence }}" \
+            --arg base "${{ needs.build.outputs.base }}" \
+            --arg bases "${{ inputs.base_images }}" \
+            --argjson size "${{ needs.build.outputs.size || 0 }}" \
+            --argjson cap "${SIZE_CAP_BYTES}" \
+            --slurpfile sbom sbom.spdx.json --slurpfile trivy trivy.json \
+            --slurpfile check check.json --slurpfile conformance conformance.json \
+            --slurpfile kev kev.json --rawfile clamav clamav.txt '
+            def f($check; $sev; $detail): {check: $check,
+              severity: ("BUILD_FINDING_SEVERITY_" + $sev), detail: ($detail | tostring | .[0:2000])};
+            ($registry == "community") as $community |
+            [($trivy[0].Results // [])[] | (.Vulnerabilities // [])[]] as $vulns |
+            [($trivy[0].Results // [])[] | (.Secrets // [])[]] as $secrets |
+            [$clamav | split("\n")[] | select(test(" FOUND$"))] as $malware |
+            [($sbom[0].packages // [])[]
+              | select((.licenseConcluded // .licenseDeclared // "")
+                | test("^(GPL-2.0|GPL-3.0|AGPL-|SSPL-|OSL-|EUPL-|CPAL-|RPL-)"))
+              | "\(.name) \(.versionInfo // "") (\(.licenseConcluded // .licenseDeclared))"] as $copyleft |
+            ($kev[0]) as $kevs |
+            [$vulns[] | select(($kevs == null) or (.VulnerabilityID as $id | $kevs | index($id))
+              or (.Severity == "CRITICAL" and (.FixedVersion // "") != ""))
+              | "\(.VulnerabilityID) (\(.Severity | ascii_downcase), \(.FixedVersion // "no fix"))"] as $blocking |
+            [
+              (if $verified then f("tag signature"; "PASSED"; "signed by " + $signer)
+               else f("tag signature"; "BLOCKED"; "the tag is not signed by a key the organisation holds now") end),
+              ([ (if $community and $private then "a community plugin'"'"'s repository is public" else empty end),
+                 (if $community and $licence != $wanted
+                  then "a community plugin'"'"'s own code is under " + $wanted + ", not " + (if $licence == "" then "no licence found" else $licence end)
+                  else empty end) ] as $p
+               | if ($p | length) > 0 then f("repository and licence"; "BLOCKED"; $p | join("; "))
+                 else f("repository and licence"; "PASSED"; if $licence == "" then "no licence named" else $licence end) end),
+              (if ([$bases | split(",")[] | select(. != "") as $b
+                    | select($base == $b or ($base | startswith($b + "@")) or ($base | startswith($b + ":")))] | length) > 0
+               then f("base image"; "PASSED"; $base)
+               else f("base image"; "BLOCKED"; "built on " + (if $base == "" then "nothing named" else $base end) + ", not plugin-python") end),
+              (if ($copyleft | length) > 0 then f("dependency screen"; "WARNING"; "strong copyleft, for counsel: " + ($copyleft[0:20] | join("; ")))
+               else f("dependency screen"; "PASSED"; "no strong copyleft found") end),
+              (if ($vulns | length) == 0 then f("vulnerabilities"; "PASSED"; "none found")
+               elif ($blocking | length) > 0 then f("vulnerabilities"; "BLOCKED";
+                 (if $kevs == null then "CISA'"'"'s KEV list could not be read; " else "" end) + ($blocking[0:20] | join("; ")))
+               else f("vulnerabilities"; "WARNING"; [$vulns[0:20][] | "\(.VulnerabilityID) (\(.Severity | ascii_downcase))"] | join("; ")) end),
+              (if ($secrets | length) > 0 then f("secrets"; "BLOCKED"; [$secrets[0:10][] | "\(.RuleID) in \(.Target // "")"] | join("; "))
+               else f("secrets"; "PASSED"; "none found") end),
+              (if ($malware | length) > 0 then f("malware"; "BLOCKED"; $malware[0:10] | join("; "))
+               else f("malware"; "PASSED"; "none found") end),
+              (if $conformance[0].passed == true then f("conformance"; "PASSED"; $conformance[0].detail // "the role'"'"'s suite passed")
+               else f("conformance"; "BLOCKED"; $conformance[0].detail // "the role'"'"'s suite did not pass") end),
+              (if $size <= 0 then f("size"; "BLOCKED"; "the image'"'"'s size was not measured")
+               elif $size > $cap then f("size"; "BLOCKED"; "\($size) bytes, over the cap of 1 GiB")
+               else f("size"; "PASSED"; "\($size) bytes") end),
+              (if $check[0].passed == true then f("plugin check"; "PASSED"; $check[0].detail // "passed")
+               else f("plugin check"; "BLOCKED"; $check[0].detail // "meridian plugin check did not pass") end),
+              (if $community then empty
+               elif $check[0].role_pages.passed == true then f("role pages"; "PASSED"; $check[0].role_pages.detail // "present")
+               else f("role pages"; "BLOCKED"; $check[0].role_pages.detail // "the role pages are missing") end)
+            ]' > findings.json
+
+      - name: Who the platform will see
+        id: oidc
+        run: |
+          token="$(curl -fsS -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" | jq -r .value)"
+          echo "::add-mask::${token}"
+          echo "token=${token}" >> "$GITHUB_OUTPUT"
+          echo "::add-mask::${{ inputs.intake_nonce }}"
+
+      - name: Hand the results back (RecordBuildResults)
+        env:
+          TOKEN: ${{ steps.oidc.outputs.token }}
+        run: |
+          url="${{ inputs.intake_url }}"; url="${url/\{build_id\}/${{ inputs.build_id }}}"
+          jq -n --arg build_id "${{ inputs.build_id }}" --arg intake_nonce "${{ inputs.intake_nonce }}" \
+            --arg image_digest "${{ steps.push.outputs.digest }}" --slurpfile findings findings.json \
+            '{build_id: $build_id, intake_nonce: $intake_nonce, image_digest: $image_digest,
+              findings: $findings[0]}' \
+          | curl -fsS -X POST -H "Authorization: Bearer ${TOKEN}" \
+              -H 'Content-Type: application/json' --data @- "$url"
