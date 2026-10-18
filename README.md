@@ -4,6 +4,7 @@ Open Meridian's registry builder. The platform dispatches this workflow to build
 
 - The publisher's build runs with read-only access and no OIDC token. Only the `sign` job, in the `signing` environment on `main`, can request a token and reach the key.
 - Every action is pinned by SHA and every image by digest.
+- Every finding is something the publisher can act on, and says what to do. A package is the base image's when its layer is one of plugin-python's, the plugin's otherwise; only the plugin's own Python packages are screened for a licence the plugin cannot include, and only its own packages for vulnerabilities, each with the fix. The base image's licences and CVEs are the platform's, not the publisher's. Each finding's detail is one short line, then, where there is more, a newline and the full text.
 
 See the registries pages at https://open-meridian.dev for how publishing works.
 

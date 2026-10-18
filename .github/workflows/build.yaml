@@ -54,6 +54,26 @@
 # copyleft in the bill of materials warns, for counsel. The base images and
 # community's licence come from the platform, as inputs.
 #
+# Every finding is something the publisher can act on, and says what to do
+# (ruling 266). A package is the base image's when the layer it came from is
+# one of plugin-python's (the base's own layer IDs, which the build job reads
+# and the provenance carries as its "base image" resolved dependency), and
+# the plugin's otherwise. Only the plugin's own packages are screened: a
+# Python package whose licence its plugin's licence cannot include, with the
+# fix; a vulnerability in the plugin's dependencies, with the version that
+# fixes it. The base image's licences and vulnerabilities are not a
+# publisher's finding: the platform reads them from the attestations and
+# keeps the base image's CVEs for its staff. What blocks is unchanged: a KEV
+# entry or a fixable critical blocks wherever it is, and an unread KEV list
+# blocks every vulnerability, each saying what to do.
+#
+# Each finding's detail is one short line (ruling 275: about 100 characters
+# at most), and, where there is more to say, a newline and the full text.
+# `detail` stays prose (DESIGN25's BuildFinding), so the contract is
+# unchanged: the platform shows the first line in the report and the whole
+# on the build's page, and CLI 0.1.47 prints the first line, the whole with
+# --details.
+#
 # The KMS key's Workload Identity Federation is pinned to that job: its
 # attribute condition requires
 #   assertion.sub ==
@@ -222,6 +242,10 @@ jobs:
             def where: "\(.file)\(if .line then ":\(.line)" else "" end)";
             ([.rules[]? | select(.rule == "role-pages")][0]) as $pages |
             {passed: (.passed == true),
+             short: (if .passed == true then "every rule holds (meridian \(.meridian // "?"))"
+                     elif has("failures") then "\(.failures | length) place(s) fail, first "
+                       + ([.failures[0:1][] | "\(.rule) at \(where)"] | join("")) + ": fix each"
+                     else "meridian plugin check did not run: see the build log" end),
              detail: (if .passed == true
                       then "every rule holds (meridian \(.meridian // "?") plugin check)"
                       elif has("failures") then "\(.failures | length) place(s) fail: "
@@ -251,6 +275,9 @@ jobs:
         id: base
         run: |
           base=""
+          # The base's own layer IDs, for the findings and the provenance:
+          # a package in one of them is the base image's, not the plugin's.
+          echo '[]' > base-layers.json
           sdk="$(timeout 120 docker run --rm --network none --read-only --tmpfs /tmp \
                    --cap-drop ALL --security-opt no-new-privileges --entrypoint python candidate:local \
                    -I -c 'import importlib.metadata as m; print(m.version("open-meridian"))' 2>/dev/null || true)"
@@ -265,6 +292,7 @@ jobs:
                    '($t | length) > 0 and $m[0:($t | length)] == $t' >/dev/null; then
                 digest="$(docker image inspect "${b}:${sdk}" --format '{{index .RepoDigests 0}}')"
                 base="${b}:${sdk}@${digest#*@}"
+                printf '%s' "$theirs" > base-layers.json
                 break
               fi
             done
@@ -377,6 +405,9 @@ jobs:
             ([.rules[]? | select(.rule == "tests-pass")][0].outcome // "not run") as $tests |
             [.failures[]? | select(.rule == "role-suite" or .rule == "tests-pass") | "\(.rule): \(.found)"] as $why |
             {passed: ($suite == "passed" and $tests == "passed"),
+             short: (if $suite == "passed" and $tests == "passed"
+                     then "role suites and the plugin'"'"'s tests passed in the image (meridian \(.meridian // "?"))"
+                     else "role-suite \($suite), tests-pass \($tests): fix what the full text names" end),
              detail: (if $suite == "passed" and $tests == "passed"
                       then "the role suites and the plugin'"'"'s tests passed in the image (meridian \(.meridian // "?") plugin check --verified --run-tests)"
                       else "role-suite \($suite), tests-pass \($tests)"
@@ -398,6 +429,7 @@ jobs:
             check.json
             conformance.json
             image-metadata.json
+            base-layers.json
 
   sign:
     needs: build
@@ -495,13 +527,25 @@ jobs:
           DIGEST: ${{ steps.push.outputs.digest }}
         run: |
           image="${IMAGE}@${DIGEST}"
+          # The base's layer IDs, held to their form: SLSA's place for a
+          # base image is a resolved dependency, and its layers go in the
+          # dependency's annotations, so the platform can tell the base
+          # image's packages from the plugin's (ruling 266).
+          jq -e 'type == "array" and all(.[]; type == "string" and test("^sha256:[0-9a-f]{64}$"))' \
+            base-layers.json >/dev/null 2>&1 || echo '[]' > base-layers.json
           jq -n --arg repo "${REPOSITORY}" --arg commit "${BUILT_COMMIT}" \
             --arg tag "${TAG}" --arg signer "${BUILT_FINGERPRINT}" \
-            --arg builder "${GITHUB_REPOSITORY}" \
+            --arg builder "${GITHUB_REPOSITORY}" --arg base "${BUILT_BASE}" \
+            --slurpfile layers base-layers.json \
             --arg run "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" '{
               buildDefinition: {buildType: "https://open-meridian.dev/plugin-builder/v1",
                 externalParameters: {repository: $repo, tag: $tag},
-                resolvedDependencies: [{uri: ("git+https://github.com/" + $repo), digest: {gitCommit: $commit}}]},
+                resolvedDependencies: ([{uri: ("git+https://github.com/" + $repo), digest: {gitCommit: $commit}}]
+                  + (if ($base | test("@sha256:[0-9a-f]{64}$")) then
+                      [{name: "base image", uri: ("oci://" + ($base | split("@")[0])),
+                        digest: {sha256: ($base | split("@sha256:")[1])},
+                        annotations: {layers: $layers[0]}}]
+                     else [] end))},
               runDetails: {builder: {id: ("https://github.com/" + $builder)},
                 metadata: {invocationId: $run}},
               repository: $repo, commit: $commit, tag: $tag, signer: $signer, builder: $builder}' \
@@ -547,81 +591,305 @@ jobs:
       # say): the platform then refuses the build, naming what it could not
       # read, rather than holding the version as building.
       - name: Findings, one per check, under plan Q4's policy
+        # Ruling 266: every finding is the publisher's to act on and says
+        # what to do; the base image's packages are the platform's. Ruling
+        # 275: a short line first, then the full text. The build job's words
+        # are read as data from the environment and the files; none is
+        # written into this script.
         if: ${{ !cancelled() }}
         run: |
-          [ -s sbom.spdx.json ] || echo '{}' > sbom.spdx.json
-          [ -s trivy.json ] || echo '{}' > trivy.json
-          [ -s check.json ] || echo '{}' > check.json
-          [ -s conformance.json ] || echo '{"passed": false}' > conformance.json
-          touch clamav.txt
-          # The build job's words, held to their forms before jq reads them.
-          [ "${BUILT_VERIFIED}" = "true" ] && verified=true || verified=false
-          [ "${BUILT_PRIVATE}" = "false" ] && private=false || private=true
-          size="${BUILT_SIZE}"; case "$size" in ''|*[!0-9]*) size=0 ;; esac
           # CISA's KEV catalogue; unread, every vulnerability found blocks.
           curl -fsS "${KEV_URL}" | jq '[.vulnerabilities[].cveID]' > kev.json || echo 'null' > kev.json
-          jq -n \
-            --arg registry "${REGISTRY}" \
-            --argjson verified "${verified}" \
-            --arg signer "${BUILT_FINGERPRINT}" \
-            --argjson private "${private}" \
-            --arg licence "${BUILT_LICENCE}" \
-            --arg wanted "${COMMUNITY_LICENCE}" \
-            --arg base "${BUILT_BASE}" \
-            --arg bases "${BASE_IMAGES}" \
-            --argjson size "${size}" \
-            --argjson cap "${SIZE_CAP_BYTES}" \
-            --slurpfile sbom sbom.spdx.json --slurpfile trivy trivy.json \
-            --slurpfile check check.json --slurpfile conformance conformance.json \
-            --slurpfile kev kev.json --rawfile clamav clamav.txt '
-            def f($check; $sev; $detail): {check: $check,
-              severity: ("BUILD_FINDING_SEVERITY_" + $sev), detail: ($detail | tostring | .[0:2000])};
-            ($registry == "community") as $community |
-            [($trivy[0].Results // [])[] | (.Vulnerabilities // [])[]] as $vulns |
-            [($trivy[0].Results // [])[] | (.Secrets // [])[]] as $secrets |
-            [$clamav | split("\n")[] | select(test(" FOUND$"))] as $malware |
-            [($sbom[0].packages // [])[]
-              | select((.licenseConcluded // .licenseDeclared // "")
-                | test("^(GPL-2.0|GPL-3.0|AGPL-|SSPL-|OSL-|EUPL-|CPAL-|RPL-)"))
-              | "\(.name) \(.versionInfo // "") (\(.licenseConcluded // .licenseDeclared))"] as $copyleft |
-            ($kev[0]) as $kevs |
-            [$vulns[] | select(($kevs == null) or (.VulnerabilityID as $id | $kevs | index($id))
-              or (.Severity == "CRITICAL" and (.FixedVersion // "") != ""))
-              | "\(.VulnerabilityID) (\(.Severity | ascii_downcase), \(.FixedVersion // "no fix"))"] as $blocking |
-            [
-              (if $verified then f("tag signature"; "PASSED"; "signed by " + $signer)
-               else f("tag signature"; "BLOCKED"; "the tag is not signed by a key the organisation holds now") end),
-              ([ (if $community and $private then "a community plugin'"'"'s repository is public" else empty end),
-                 (if $community and $licence != $wanted
-                  then "a community plugin'"'"'s own code is under " + $wanted + ", not " + (if $licence == "" then "no licence found" else $licence end)
-                  else empty end) ] as $p
-               | if ($p | length) > 0 then f("repository and licence"; "BLOCKED"; $p | join("; "))
-                 else f("repository and licence"; "PASSED"; if $licence == "" then "no licence named" else $licence end) end),
-              (if ([$bases | split(",")[] | select(. != "") as $b
-                    | select($base == $b or ($base | startswith($b + "@")) or ($base | startswith($b + ":")))] | length) > 0
-               then f("base image"; "PASSED"; $base)
-               else f("base image"; "BLOCKED"; "built on " + (if $base == "" then "nothing named" else $base end) + ", not plugin-python") end),
-              (if ($copyleft | length) > 0 then f("dependency screen"; "WARNING"; "strong copyleft, for counsel: " + ($copyleft[0:20] | join("; ")))
-               else f("dependency screen"; "PASSED"; "no strong copyleft found") end),
-              (if ($vulns | length) == 0 then f("vulnerabilities"; "PASSED"; "none found")
-               elif ($blocking | length) > 0 then f("vulnerabilities"; "BLOCKED";
-                 (if $kevs == null then "CISA'"'"'s KEV list could not be read; " else "" end) + ($blocking[0:20] | join("; ")))
-               else f("vulnerabilities"; "WARNING"; [$vulns[0:20][] | "\(.VulnerabilityID) (\(.Severity | ascii_downcase))"] | join("; ")) end),
-              (if ($secrets | length) > 0 then f("secrets"; "BLOCKED"; [$secrets[0:10][] | "\(.RuleID) in \(.Target // "")"] | join("; "))
-               else f("secrets"; "PASSED"; "none found") end),
-              (if ($malware | length) > 0 then f("malware"; "BLOCKED"; $malware[0:10] | join("; "))
-               else f("malware"; "PASSED"; "none found") end),
-              (if $conformance[0].passed == true then f("conformance"; "PASSED"; $conformance[0].detail // "the role'"'"'s suite passed")
-               else f("conformance"; "BLOCKED"; $conformance[0].detail // "the role'"'"'s suite did not pass") end),
-              (if $size <= 0 then f("size"; "BLOCKED"; "the image'"'"'s size was not measured")
-               elif $size > $cap then f("size"; "BLOCKED"; "\($size) bytes, over the cap of 1 GiB")
-               else f("size"; "PASSED"; "\($size) bytes") end),
-              (if $check[0].passed == true then f("plugin check"; "PASSED"; $check[0].detail // "passed")
-               else f("plugin check"; "BLOCKED"; $check[0].detail // "meridian plugin check did not pass") end),
-              (if $community then empty
-               elif $check[0].role_pages.passed == true then f("role pages"; "PASSED"; $check[0].role_pages.detail // "present")
-               else f("role pages"; "BLOCKED"; $check[0].role_pages.detail // "the role pages are missing") end)
-            ]' > findings.json
+          python3 -I - . > findings.json <<'PY'
+          import json, os, pathlib, re, sys
+
+          w = pathlib.Path(sys.argv[1])
+          env = os.environ.get
+
+
+          def read(name, empty):
+              try:
+                  value = json.loads((w / name).read_text())
+              except (OSError, ValueError):
+                  return empty
+              return value if isinstance(value, type(empty)) else empty
+
+
+          def text(name):
+              try:
+                  return (w / name).read_text(errors="replace")
+              except OSError:
+                  return ""
+
+
+          def finding(check, severity, short, full=""):
+              """One BuildFinding: a short line, then the full text where it says more."""
+              short = " ".join(str(short).split())
+              detail = short if not full or full == short else short + "\n" + str(full)
+              return {"check": check, "severity": "BUILD_FINDING_SEVERITY_" + severity, "detail": detail[:2000]}
+
+
+          def clipped(line, limit=100):
+              line = " ".join(str(line).split())
+              return line if len(line) <= limit else line[: limit - 1].rstrip(" ;,") + "…"
+
+
+          def key(version):
+              """A loose version order, enough to pick a fixed version."""
+              return [(0, int(p), "") if p.isdigit() else (1, 0, p) for p in re.split(r"[^0-9A-Za-z]+", str(version)) if p]
+
+
+          community = env("REGISTRY") == "community"
+          verified_tag = env("BUILT_VERIFIED") == "true"
+          public = env("BUILT_PRIVATE") == "false"
+          licence = env("BUILT_LICENCE", "")
+          wanted = env("COMMUNITY_LICENCE", "")
+          base = env("BUILT_BASE", "")
+          bases = [b for b in env("BASE_IMAGES", "").split(",") if b]
+          size = int(env("BUILT_SIZE", "")) if env("BUILT_SIZE", "").isdigit() else 0
+          cap = int(env("SIZE_CAP_BYTES", "1073741824"))
+          sbom, trivy = read("sbom.spdx.json", {}), read("trivy.json", {})
+          check, conformance = read("check.json", {}), read("conformance.json", {})
+          try:
+              listed = json.loads(text("kev.json"))
+          except ValueError:
+              listed = None
+          kev = set(map(str, listed)) if isinstance(listed, list) else None
+          on_base = any(base == b or base.startswith(b + "@") or base.startswith(b + ":") for b in bases)
+          base_layers = set(read("base-layers.json", [])) if on_base else set()
+
+
+          def owner(layer):
+              """The base image's when its layer is one of the base's; the plugin's otherwise."""
+              return "base image" if layer and layer in base_layers else "plugin"
+
+
+          # ── The plugin's own packages and their licences ──
+          OS_TYPES = {"alma", "alpine", "amazon", "azurelinux", "bottlerocket", "cbl-mariner", "centos",
+                      "chainguard", "debian", "echo", "minimos", "opensuse", "opensuse.leap",
+                      "opensuse.tumbleweed", "oracle", "photon", "redhat", "rocky", "sles", "suse",
+                      "ubuntu", "wolfi"}
+          STRONG = re.compile(r"(A?GPL|SSPL|OSL|EUPL|CPAL|RPL)-", re.I)
+          LINKING = re.compile(r"classpath|link", re.I)
+
+
+          def conflicting(expression):
+              """The terms of an SPDX expression a permissive or closed plugin cannot include:
+              none when an alternative of an OR allows it; a linking exception allows it."""
+              tokens = re.findall(r"\(|\)|[^\s()]+", expression or "")
+              at = [0]
+
+              def peek():
+                  return tokens[at[0]] if at[0] < len(tokens) else ""
+
+              def alternatives():
+                  found = [conjunction()]
+                  while peek().upper() == "OR":
+                      at[0] += 1
+                      found.append(conjunction())
+                  return [] if any(not f for f in found) else found[0]
+
+              def conjunction():
+                  found = term()
+                  while peek().upper() == "AND":
+                      at[0] += 1
+                      found = found + term()
+                  return found
+
+              def term():
+                  token = peek()
+                  if not token:
+                      return []
+                  at[0] += 1
+                  if token == "(":
+                      found = alternatives()
+                      if peek() == ")":
+                          at[0] += 1
+                  else:
+                      found = [token] if STRONG.match(token) else []
+                  if peek().upper() == "WITH":
+                      exception = tokens[at[0] + 1] if at[0] + 1 < len(tokens) else ""
+                      at[0] += 2
+                      if LINKING.search(exception):
+                          found = []
+                  return found
+
+              return alternatives()
+
+
+          packages = []
+          for p in sbom.get("packages") or []:
+              if not isinstance(p, dict):
+                  continue
+              notes = dict(str(t).split(": ", 1) for t in p.get("attributionTexts") or [] if ": " in str(t))
+              if not notes.get("PkgType"):
+                  continue
+              stated = [str(p.get(k) or "") for k in ("licenseConcluded", "licenseDeclared")]
+              packages.append({"name": str(p.get("name") or ""), "version": str(p.get("versionInfo") or ""),
+                               "licence": next((s for s in stated if s not in ("", "NOASSERTION", "NONE")), ""),
+                               "type": notes["PkgType"], "source": owner(notes.get("LayerDiffID", ""))})
+          declared = wanted if community else licence
+          article = "an" if declared[:1].upper() in "AEFHILMNORSX" and declared else "a"
+          kind = f"{article} {declared}" if declared else "a closed-source"
+          conflicts = []
+          if not STRONG.match(declared or ""):
+              for p in packages:
+                  if p["source"] == "plugin" and p["type"] not in OS_TYPES:
+                      terms = conflicting(p["licence"])
+                      if terms:
+                          conflicts.append((p, " AND ".join(dict.fromkeys(terms))))
+          fixes = [f"{p['name']} {p['version']} is {t}, which {kind} plugin cannot include: "
+                   "replace it, or relicense the plugin" for p, t in conflicts]
+
+          # ── Vulnerabilities, by owner ──
+          vulns = [v for r in trivy.get("Results") or [] if isinstance(r, dict)
+                   for v in r.get("Vulnerabilities") or [] if isinstance(v, dict)]
+
+
+          def fixed_in(v):
+              offered = [c.strip() for c in str(v.get("FixedVersion") or "").split(",") if c.strip()]
+              above = [c for c in offered if key(c) > key(v.get("InstalledVersion", ""))]
+              return min(above, key=key) if above else (max(offered, key=key) if offered else "")
+
+
+          def why(v):
+              if kev is not None and v.get("VulnerabilityID") in kev:
+                  return "on CISA's KEV list"
+              return f"{str(v.get('Severity', '')).lower()}, fixed in {fixed_in(v)}"
+
+
+          for v in vulns:
+              v["_owner"] = owner((v.get("Layer") or {}).get("DiffID", ""))
+          blocking = [v for v in vulns if kev is None or v.get("VulnerabilityID") in kev
+                      or (v.get("Severity") == "CRITICAL" and v.get("FixedVersion"))]
+          mine = [v for v in vulns if v["_owner"] == "plugin"]
+          grouped = {}
+          for v in mine:
+              grouped.setdefault((v.get("PkgName", ""), v.get("InstalledVersion", "")), []).append(v)
+          RANK = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
+          bumps = []
+          for (name, installed), found in sorted(grouped.items()):
+              ids = ", ".join(dict.fromkeys(str(v.get("VulnerabilityID")) for v in found))
+              worst = max((str(v.get("Severity", "")) for v in found), key=lambda s: RANK.get(s, 0)).lower()
+              targets = [fixed_in(v) for v in found]
+              if all(targets):
+                  bumps.append((name, max(targets, key=key), f"bump {name} to {max(targets, key=key)} or later ({ids}, {worst})"))
+              else:
+                  bumps.append((name, "", f"{name} {installed} has {ids} ({worst}) with no fixed version yet: "
+                                "replace it, or watch for a fix"))
+
+          # ── The rest of the build job's output ──
+          secrets = [s for r in trivy.get("Results") or [] if isinstance(r, dict)
+                     for s in r.get("Secrets") or [] if isinstance(s, dict)]
+          malware = [line for line in text("clamav.txt").splitlines() if line.endswith(" FOUND")]
+          name_of_base = base.split("@")[0].rsplit("/", 1)[-1].replace(":", " ")
+
+          out = []
+          out.append(finding("tag signature", "PASSED", f"signed by {env('BUILT_FINGERPRINT', '')}") if verified_tag
+                     else finding("tag signature", "BLOCKED", "the tag is not signed by a key the organisation holds now: "
+                                  "sign it with a registered key (git tag -s)"))
+          problems = []
+          if community and not public:
+              problems.append("the repository is private, and a community plugin's is public: make it public")
+          if community and licence != wanted:
+              problems.append(f"its own code is under {licence or 'no licence found'}, and a community plugin's "
+                              f"is under {wanted}: license it under {wanted}")
+          out.append(finding("repository and licence", "BLOCKED", clipped(problems[0]), "; ".join(problems)) if problems
+                     else finding("repository and licence", "PASSED", licence or "no licence named"))
+          if on_base:
+              digest = base.split("@", 1)[1] if "@" in base else ""
+              out.append(finding("base image", "PASSED", f"{name_of_base} ({digest[:19]})", base))
+          else:
+              out.append(finding("base image", "BLOCKED",
+                                 "not built on plugin-python: build FROM it, at the SDK version the image installs",
+                                 f"built on {base or 'nothing named'}, not on {', '.join(bases) or 'plugin-python'}: "
+                                 f"start the Dockerfile FROM {bases[0] if bases else 'plugin-python'}:<the open-meridian "
+                                 "version it installs>"))
+          if fixes:
+              first, terms = conflicts[0]
+              short = (f"{first['name']} {first['version']} is {terms}: replace it, or relicense the plugin"
+                       if len(fixes) == 1 else
+                       f"{len(fixes)} dependencies conflict with {declared or 'a closed-source licence'}: "
+                       + ", ".join(p["name"] for p, _ in conflicts[:3]) + (" …" if len(fixes) > 3 else "")
+                       + "; replace them, or relicense")
+              out.append(finding("dependency screen", "WARNING", clipped(short), "\n".join(fixes)))
+          elif packages:
+              out.append(finding("dependency screen", "PASSED", "nothing to act on in the plugin's dependencies"))
+          else:
+              out.append(finding("dependency screen", "PASSED", "the bill of materials lists no packages"))
+          if vulns and blocking:
+              if kev is None:
+                  out.append(finding("vulnerabilities", "BLOCKED",
+                                     "CISA's KEV list could not be read, so the build is held: publish again later",
+                                     f"CISA's KEV list could not be read, so each of the {len(vulns)} vulnerabilities "
+                                     "found blocks: publish again once it can be read"))
+              else:
+                  lines, shorts = [], []
+                  for v in blocking:
+                      name, cve = v.get("PkgName"), v.get("VulnerabilityID")
+                      if v["_owner"] == "plugin":
+                          act = f"bump {name} to {fixed_in(v) or 'a fixed version'} or later"
+                          lines.append(f"{cve} in {name} {v.get('InstalledVersion')} ({why(v)}): {act}")
+                          shorts.append(f"{cve} in {name} ({why(v)}): {act}")
+                      else:
+                          lines.append(f"{cve} in the base image's {name} {v.get('InstalledVersion')} "
+                                       f"({why(v)}): rebuild on a plugin-python with the fix")
+                          shorts.append(f"{cve} in the base image's {name}: rebuild on a fixed plugin-python")
+                  short = shorts[0] if len(shorts) == 1 else f"{len(shorts)} block, first " + shorts[0]
+                  out.append(finding("vulnerabilities", "BLOCKED", clipped(short), "\n".join(lines[:40])))
+          elif bumps:
+              short = (bumps[0][2] if len(bumps) == 1 else
+                       f"bump {len(bumps)} dependencies: "
+                       + ", ".join(f"{n} to {t}" if t else n for n, t, _ in bumps[:2])
+                       + (f" and {len(bumps) - 2} more" if len(bumps) > 2 else ""))
+              out.append(finding("vulnerabilities", "WARNING", clipped(short), "\n".join(line for _, _, line in bumps[:40])))
+          else:
+              out.append(finding("vulnerabilities", "PASSED", "none in the plugin's dependencies"))
+          if secrets:
+              lines = [f"{s.get('RuleID')} in {s.get('Target', '')}" for s in secrets[:10]]
+              out.append(finding("secrets", "BLOCKED",
+                                 clipped(f"{lines[0]}: remove it from the image and revoke it" if len(lines) == 1
+                                         else f"{len(secrets)} found, first {lines[0]}: remove each and revoke it"),
+                                 "; ".join(lines) + ": remove each from the image and revoke it"))
+          else:
+              out.append(finding("secrets", "PASSED", "none found"))
+          if malware:
+              out.append(finding("malware", "BLOCKED",
+                                 clipped(f"{malware[0]}: remove the file" if len(malware) == 1
+                                         else f"{len(malware)} files flagged, first {malware[0]}"),
+                                 "; ".join(malware[:10]) + ": remove each flagged file"))
+          else:
+              out.append(finding("malware", "PASSED", "none found"))
+          if conformance.get("passed") is True:
+              out.append(finding("conformance", "PASSED", clipped(conformance.get("short") or "the role's suite passed"),
+                                 str(conformance.get("detail") or "")))
+          else:
+              out.append(finding("conformance", "BLOCKED",
+                                 clipped(conformance.get("short") or "the conformance suite did not run: see the build log"),
+                                 str(conformance.get("detail") or "")))
+          if size <= 0:
+              out.append(finding("size", "BLOCKED", "the image was not measured: see the build log"))
+          elif size > cap:
+              out.append(finding("size", "BLOCKED", f"{size / 2**30:.2f} GiB, over the 1 GiB cap: make the image smaller",
+                                 f"{size} bytes; the cap is {cap} bytes"))
+          else:
+              out.append(finding("size", "PASSED", f"{round(size / 2**20)} MiB of the 1 GiB cap",
+                                 f"{size} bytes; the cap is {cap} bytes"))
+          if check.get("passed") is True:
+              out.append(finding("plugin check", "PASSED", clipped(check.get("short") or "passed"), str(check.get("detail") or "")))
+          else:
+              out.append(finding("plugin check", "BLOCKED",
+                                 clipped(check.get("short") or "meridian plugin check did not pass: see the build log"),
+                                 str(check.get("detail") or "")))
+          if not community:
+              pages = check.get("role_pages") if isinstance(check.get("role_pages"), dict) else {}
+              if pages.get("passed") is True:
+                  out.append(finding("role pages", "PASSED", clipped(pages.get("detail") or "present")))
+              else:
+                  missing = str(pages.get("detail") or "the role pages are missing")
+                  out.append(finding("role pages", "BLOCKED", clipped(missing + ": add each role's page"), missing))
+          json.dump(out, sys.stdout)
+          PY
 
       - name: Who the platform will see
         if: ${{ !cancelled() }}
