@@ -73,6 +73,14 @@
 # as placeholders), create the `signing` environment limited to the main
 # branch, and set the repository variables.
 #
+# Nothing the dispatch or the build job hands on is written into a script:
+# every `inputs.*`, `needs.*.outputs.*` and `steps.*.outputs.*` a `run:`
+# block uses reaches it through `env:` and is quoted there, so text the
+# publisher controls (a Dockerfile's FROM line, say) is data to the shell,
+# never code (GitHub's script-injection guidance). The build's one-time
+# nonce is masked by the signing job's first step, read from the event
+# payload, before any step header could print it.
+#
 # DESIGN25 seams, marked SEAM below: `meridian plugin check --json` and the
 # conformance command's exact invocation and output, which v25's CLI and SDK
 # define.
@@ -116,6 +124,10 @@ jobs:
     # secrets. It can read, build and report, and nothing else.
     permissions:
       contents: read
+    env:
+      LISTING: ${{ inputs.listing }}
+      REPOSITORY: ${{ inputs.repository }}
+      TAG: ${{ inputs.tag }}
     outputs:
       commit: ${{ steps.tag.outputs.commit }}
       verified: ${{ steps.tag.outputs.verified }}
@@ -137,7 +149,7 @@ jobs:
       - name: Verify the tag's signature against the organisation's keys
         id: tag
         run: |
-          org="${{ inputs.listing }}"; org="${org%%/*}"
+          org="${LISTING%%/*}"
           # meridian.v1.SigningKeyStatus: issued_at_ns, keys, signature.
           curl -fsS "${PLATFORM}/api/v1/registry/signing-keys" -o status.json
           # Active keys only: not_trusted_after_ns 0, or later than now.
@@ -146,9 +158,9 @@ jobs:
             | select(.not_trusted_after_ns == 0 or .not_trusted_after_ns > $now)
             | "builder@open-meridian \(.public_key)"' status.json > allowed_signers
           cd src
-          commit="$(git rev-parse "${{ inputs.tag }}^{commit}")"
+          commit="$(git rev-parse "refs/tags/${TAG}^{commit}")"
           if out="$(git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=../allowed_signers \
-                verify-tag "${{ inputs.tag }}" 2>&1)"; then verified=true; else verified=false; fi
+                verify-tag "refs/tags/${TAG}" 2>&1)"; then verified=true; else verified=false; fi
           echo "$out"
           fp="$(printf '%s' "$out" | grep -o 'SHA256:[A-Za-z0-9+/]*' | head -1 || true)"
           echo "commit=${commit}" >> "$GITHUB_OUTPUT"
@@ -158,7 +170,7 @@ jobs:
       - name: The repository's visibility and licence
         id: repo
         run: |
-          curl -fsS "https://api.github.com/repos/${{ inputs.repository }}" > repo.json
+          curl -fsS "https://api.github.com/repos/${REPOSITORY}" > repo.json
           echo "private=$(jq -r .private repo.json)" >> "$GITHUB_OUTPUT"
           echo "licence=$(jq -r '.license.spdx_id // ""' repo.json)" >> "$GITHUB_OUTPUT"
 
@@ -231,15 +243,36 @@ jobs:
     env:
       AUDIENCE: ${{ vars.PLATFORM_OIDC_AUDIENCE }}  # open-meridian-registry
       KMS_KEY: ${{ vars.KMS_KEY }}                  # gcpkms://projects/.../cryptoKeyVersions/1
+      BUILD_ID: ${{ inputs.build_id }}
+      REPOSITORY: ${{ inputs.repository }}
+      TAG: ${{ inputs.tag }}
+      REGISTRY: ${{ inputs.registry }}
+      IMAGE: ${{ inputs.image }}
+      INTAKE_URL: ${{ inputs.intake_url }}
+      BASE_IMAGES: ${{ inputs.base_images }}
+      COMMUNITY_LICENCE: ${{ inputs.community_licence }}
+      BUILT_COMMIT: ${{ needs.build.outputs.commit }}
+      BUILT_VERIFIED: ${{ needs.build.outputs.verified }}
+      BUILT_FINGERPRINT: ${{ needs.build.outputs.fingerprint }}
+      BUILT_PRIVATE: ${{ needs.build.outputs.private }}
+      BUILT_LICENCE: ${{ needs.build.outputs.licence }}
+      BUILT_BASE: ${{ needs.build.outputs.base }}
+      BUILT_SIZE: ${{ needs.build.outputs.size }}
     steps:
+      # First, before any header could print it: the nonce masked, read from
+      # the event payload rather than written into this script or an env.
+      - name: Mask the build's nonce
+        run: echo "::add-mask::$(jq -r '.inputs.intake_nonce // ""' "$GITHUB_EVENT_PATH")"
+
       - name: Tell the platform the build has begun (RecordBuildStarted)
+        env:
+          INTAKE_NONCE: ${{ inputs.intake_nonce }}
         run: |
           token="$(curl -fsS -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
             "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" | jq -r .value)"
           echo "::add-mask::${token}"
-          echo "::add-mask::${{ inputs.intake_nonce }}"
-          url="${{ inputs.intake_url }}"; url="${url/\{build_id\}/${{ inputs.build_id }}}"
-          jq -n --arg build_id "${{ inputs.build_id }}" --arg intake_nonce "${{ inputs.intake_nonce }}" \
+          url="${INTAKE_URL/\{build_id\}/${BUILD_ID}}"
+          jq -n --arg build_id "${BUILD_ID}" --arg intake_nonce "${INTAKE_NONCE}" \
             --arg log_url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
             '{build_id: $build_id, intake_nonce: $intake_nonce, log_url: $log_url}' \
           | curl -fsS -X POST -H "Authorization: Bearer ${token}" \
@@ -266,29 +299,34 @@ jobs:
 
       - name: Push by digest, within the size cap
         id: push
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          if [ ! -s image.tar ] || [ "${{ needs.build.outputs.size || 0 }}" -gt "${SIZE_CAP_BYTES}" ]; then
+          size="${BUILT_SIZE}"; case "$size" in ''|*[!0-9]*) size=0 ;; esac
+          if [ ! -s image.tar ] || [ "$size" -gt "${SIZE_CAP_BYTES}" ]; then
             echo "no image, or over the 1 GiB cap: nothing is pushed"
             echo "digest=" >> "$GITHUB_OUTPUT"; exit 0
           fi
           docker load -i image.tar
-          if [ "${{ inputs.registry }}" = "community" ]; then
-            echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          if [ "${REGISTRY}" = "community" ]; then
+            printf '%s' "${GITHUB_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
           else
-            gcloud auth configure-docker "${{ inputs.image }}" --quiet  # verified, Phase 2
+            gcloud auth configure-docker "${IMAGE}" --quiet  # verified, Phase 2
           fi
-          ref="${{ inputs.image }}:${{ inputs.tag }}"
+          ref="${IMAGE}:${TAG}"
           docker tag candidate:local "$ref" && docker push "$ref"
           digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$ref" | cut -d@ -f2)"
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
       - name: Provenance and metadata, signed with the platform's KMS key
         if: steps.push.outputs.digest != ''
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
         run: |
-          image="${{ inputs.image }}@${{ steps.push.outputs.digest }}"
+          image="${IMAGE}@${DIGEST}"
           [ -s check.json ] || echo '{}' > check.json
-          jq -n --arg repo "${{ inputs.repository }}" --arg commit "${{ needs.build.outputs.commit }}" \
-            --arg tag "${{ inputs.tag }}" --arg signer "${{ needs.build.outputs.fingerprint }}" \
+          jq -n --arg repo "${REPOSITORY}" --arg commit "${BUILT_COMMIT}" \
+            --arg tag "${TAG}" --arg signer "${BUILT_FINGERPRINT}" \
             --arg builder "${GITHUB_REPOSITORY}" \
             --arg run "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" '{
               buildDefinition: {buildType: "https://open-meridian.dev/plugin-builder/v1",
@@ -337,18 +375,22 @@ jobs:
           [ -s check.json ] || echo '{}' > check.json
           [ -s conformance.json ] || echo '{"passed": false}' > conformance.json
           touch clamav.txt
+          # The build job's words, held to their forms before jq reads them.
+          [ "${BUILT_VERIFIED}" = "true" ] && verified=true || verified=false
+          [ "${BUILT_PRIVATE}" = "false" ] && private=false || private=true
+          size="${BUILT_SIZE}"; case "$size" in ''|*[!0-9]*) size=0 ;; esac
           # CISA's KEV catalogue; unread, every vulnerability found blocks.
           curl -fsS "${KEV_URL}" | jq '[.vulnerabilities[].cveID]' > kev.json || echo 'null' > kev.json
           jq -n \
-            --arg registry "${{ inputs.registry }}" \
-            --argjson verified "${{ needs.build.outputs.verified || 'false' }}" \
-            --arg signer "${{ needs.build.outputs.fingerprint }}" \
-            --argjson private "${{ needs.build.outputs.private || 'true' }}" \
-            --arg licence "${{ needs.build.outputs.licence }}" \
-            --arg wanted "${{ inputs.community_licence }}" \
-            --arg base "${{ needs.build.outputs.base }}" \
-            --arg bases "${{ inputs.base_images }}" \
-            --argjson size "${{ needs.build.outputs.size || 0 }}" \
+            --arg registry "${REGISTRY}" \
+            --argjson verified "${verified}" \
+            --arg signer "${BUILT_FINGERPRINT}" \
+            --argjson private "${private}" \
+            --arg licence "${BUILT_LICENCE}" \
+            --arg wanted "${COMMUNITY_LICENCE}" \
+            --arg base "${BUILT_BASE}" \
+            --arg bases "${BASE_IMAGES}" \
+            --argjson size "${size}" \
             --argjson cap "${SIZE_CAP_BYTES}" \
             --slurpfile sbom sbom.spdx.json --slurpfile trivy trivy.json \
             --slurpfile check check.json --slurpfile conformance conformance.json \
@@ -410,16 +452,17 @@ jobs:
             "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" | jq -r .value)"
           echo "::add-mask::${token}"
           echo "token=${token}" >> "$GITHUB_OUTPUT"
-          echo "::add-mask::${{ inputs.intake_nonce }}"
 
       - name: Hand the results back (RecordBuildResults)
         if: ${{ !cancelled() }}
         env:
           TOKEN: ${{ steps.oidc.outputs.token }}
+          INTAKE_NONCE: ${{ inputs.intake_nonce }}
+          DIGEST: ${{ steps.push.outputs.digest }}
         run: |
-          url="${{ inputs.intake_url }}"; url="${url/\{build_id\}/${{ inputs.build_id }}}"
-          jq -n --arg build_id "${{ inputs.build_id }}" --arg intake_nonce "${{ inputs.intake_nonce }}" \
-            --arg image_digest "${{ steps.push.outputs.digest }}" --slurpfile findings findings.json \
+          url="${INTAKE_URL/\{build_id\}/${BUILD_ID}}"
+          jq -n --arg build_id "${BUILD_ID}" --arg intake_nonce "${INTAKE_NONCE}" \
+            --arg image_digest "${DIGEST}" --slurpfile findings findings.json \
             '{build_id: $build_id, intake_nonce: $intake_nonce, image_digest: $image_digest,
               findings: $findings[0]}' \
           | curl -fsS -X POST -H "Authorization: Bearer ${TOKEN}" \
