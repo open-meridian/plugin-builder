@@ -13,9 +13,10 @@
 #
 # - `build` checks out the commit the tag pins, verifies the tag's SSH
 #   signature against the organisation's keys active now (SigningKeyStatus),
-#   builds on plugin-python, scans with Trivy (bill of materials,
-#   vulnerabilities, secrets) and ClamAV (malware), runs the role's
-#   conformance suite and measures the image. The publisher's Dockerfile runs
+#   builds on plugin-python (held to it by the image's own layers), reads
+#   the image's metadata from the image itself, scans with Trivy (bill of
+#   materials, vulnerabilities, secrets) and ClamAV (malware), runs the
+#   role's conformance suite in the image and measures the image. The publisher's Dockerfile runs
 #   here, so this job holds no id-token and cannot push: its permissions are
 #   contents: read alone. It hands the image and its findings on as
 #   artifacts.
@@ -81,9 +82,21 @@
 # nonce is masked by the signing job's first step, read from the event
 # payload, before any step header could print it.
 #
-# DESIGN25 seams, marked SEAM below: `meridian plugin check --json` and the
-# conformance command's exact invocation and output, which v25's CLI and SDK
-# define.
+# DESIGN25's seams, closed by rulings 268 to 271 (2026-10-18): the image's
+# metadata is read from the built image with the SDK's own
+# `meridian-declaration` (CLI 0.1.46 and SDK 0.29.0 need nothing new);
+# conformance is each role's suite through the SDK's runner and the
+# plugin's tests, `meridian plugin check --verified --run-tests` inside a
+# layer over the image; "built on plugin-python" is the image's layers
+# beginning with an allowed base's.
+#
+# `smoke_test` (ruling 271) runs neither job: a `smoke` job in the same
+# `signing` environment, so its token meets the key's condition unchanged,
+# attests a throwaway image in a registry on its own runner with the KMS
+# key, verifies the envelope as the platform's intake does, and prints the
+# key's public half. It never calls the platform. Dispatch it on main with
+# smoke_test=true and any placeholder for the other inputs, which it reads
+# none of (README).
 
 name: build
 
@@ -100,6 +113,7 @@ on:
       intake_nonce: {description: "The build's one-time nonce", required: true}
       base_images: {description: "The images a plugin may be built on, comma-separated", required: true}
       community_licence: {description: "Community's licence for a plugin's own code", required: true}
+      smoke_test: {description: "Only attest and verify a throwaway image with the KMS key", type: boolean, default: false}
 
 # Nothing by default; each job says what it holds.
 permissions: {}
@@ -115,9 +129,17 @@ env:
   CLAMAV_IMAGE: clamav/clamav:1.4@sha256:b5b910ce43d595bf8a2fe401e34db56434602b2c755b7c2b07f00c917d04d469
   KEV_URL: https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json
   METADATA_TYPE: https://open-meridian.dev/attestation/plugin-metadata/v1
+  # The image's metadata, at most: the declaration and the documentation,
+  # which the SDK caps at 256 KiB.
+  METADATA_CAP_BYTES: "1048576"
+  # The meridian whose rules a plugin is held to, and its x86_64 Linux
+  # binary's SHA-256 (meridian-cli's release v0.1.46).
+  MERIDIAN_VERSION: 0.1.46
+  MERIDIAN_SHA256: f648dab0b2f671a7b1c1a0d306d87c5a12b6fb18b3c427f78406edddda891816
 
 jobs:
   build:
+    if: ${{ !inputs.smoke_test }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     # The publisher's code runs in this job: no id-token, no packages, no
@@ -128,13 +150,15 @@ jobs:
       LISTING: ${{ inputs.listing }}
       REPOSITORY: ${{ inputs.repository }}
       TAG: ${{ inputs.tag }}
+      REGISTRY: ${{ inputs.registry }}
+      BASE_IMAGES: ${{ inputs.base_images }}
     outputs:
       commit: ${{ steps.tag.outputs.commit }}
       verified: ${{ steps.tag.outputs.verified }}
       fingerprint: ${{ steps.tag.outputs.fingerprint }}
       private: ${{ steps.repo.outputs.private }}
       licence: ${{ steps.repo.outputs.licence }}
-      base: ${{ steps.build.outputs.base }}
+      base: ${{ steps.base.outputs.base }}
       size: ${{ steps.build.outputs.size }}
     steps:
       - name: Check out the commit the tag pins
@@ -174,25 +198,141 @@ jobs:
           echo "private=$(jq -r .private repo.json)" >> "$GITHUB_OUTPUT"
           echo "licence=$(jq -r '.license.spdx_id // ""' repo.json)" >> "$GITHUB_OUTPUT"
 
-      - name: Plugin check (pre-flight, metadata, documentation, role pages)
-        # SEAM: the CLI's JSON output of `meridian plugin check`, v25's CLI:
-        # passed, detail, metadata (PluginMetadata), schema_version (v<N>),
-        # documentation [{name, title, text, digest}], role_pages {passed, detail}.
+      - name: meridian, pinned by its checksum
+        # The rules `plugin check` holds are compiled into the binary, so the
+        # builder names the release it holds plugins to, and the binary is
+        # held to a checksum written here, not one fetched beside it.
         run: |
-          curl -fsSL "${PLATFORM}/install" | sh
-          (cd src && meridian plugin check --json) > check.json || true
-          jq -e . check.json >/dev/null || echo '{}' > check.json
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o "$HOME/.local/bin/meridian" \
+            "https://github.com/open-meridian/meridian-cli/releases/download/v${MERIDIAN_VERSION}/meridian-x86_64-unknown-linux-musl"
+          echo "${MERIDIAN_SHA256}  $HOME/.local/bin/meridian" | sha256sum -c -
+          chmod +x "$HOME/.local/bin/meridian"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Build on plugin-python
+      - name: Plugin check (the publish pre-flight's rules)
+        # As `meridian plugin publish` runs it: `--verified` for the
+        # verified registry, whose "role pages" finding is that run's
+        # role-pages rule.
+        run: |
+          flags=""; [ "${REGISTRY}" = "verified" ] && flags="--verified"
+          (cd src && meridian plugin check ${flags} --json) > check-run.json || true
+          jq -e 'type == "object"' check-run.json >/dev/null 2>&1 || echo '{}' > check-run.json
+          jq '
+            def where: "\(.file)\(if .line then ":\(.line)" else "" end)";
+            ([.rules[]? | select(.rule == "role-pages")][0]) as $pages |
+            {passed: (.passed == true),
+             detail: (if .passed == true
+                      then "every rule holds (meridian \(.meridian // "?") plugin check)"
+                      elif has("failures") then "\(.failures | length) place(s) fail: "
+                        + ([.failures[0:10][] | "\(.rule) at \(where)"] | join("; "))
+                      else "meridian plugin check did not run" end),
+             role_pages: {passed: ($pages.outcome == "passed"),
+               detail: (if $pages == null then "the role-pages rule did not run"
+                        elif $pages.outcome == "passed" then "present"
+                        else ([.failures[]? | select(.rule == "role-pages") | "\(.found) (\(where))"][0:5]
+                              | if length > 0 then join("; ") else "role-pages \($pages.outcome)" end) end)}}
+          ' check-run.json > check.json
+
+      - name: Build
         id: build
         run: |
-          base="$(grep -m1 -iE '^FROM ' src/Dockerfile | awk '{print $2}')"
-          echo "base=${base}" >> "$GITHUB_OUTPUT"
           docker build --pull -t candidate:local src
           size="$(docker image inspect candidate:local --format '{{.Size}}')"
           echo "size=${size}" >> "$GITHUB_OUTPUT"
           docker save candidate:local -o image.tar
           docker create --name fs candidate:local >/dev/null && docker export fs -o rootfs.tar
+
+      - name: Built on plugin-python, by the image's own layers
+        # Not the Dockerfile's text, which ARGs, --platform and stages make
+        # unreliable: an allowed base, at the open-meridian version the image
+        # carries, whose layers the image's begin with. A layer's ID is the
+        # hash of its content, so no image has them without being built on it.
+        id: base
+        run: |
+          base=""
+          sdk="$(timeout 120 docker run --rm --network none --read-only --tmpfs /tmp \
+                   --cap-drop ALL --security-opt no-new-privileges --entrypoint python candidate:local \
+                   -I -c 'import importlib.metadata as m; print(m.version("open-meridian"))' 2>/dev/null || true)"
+          if printf '%s' "$sdk" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z.]+)?$'; then
+            mine="$(docker image inspect candidate:local --format '{{json .RootFS.Layers}}')"
+            IFS=, read -ra allowed <<< "${BASE_IMAGES}"
+            for b in "${allowed[@]}"; do
+              [ -n "$b" ] || continue
+              docker pull -q "${b}:${sdk}" >/dev/null 2>&1 || continue
+              theirs="$(docker image inspect "${b}:${sdk}" --format '{{json .RootFS.Layers}}')"
+              if jq -en --argjson m "$mine" --argjson t "$theirs" \
+                   '($t | length) > 0 and $m[0:($t | length)] == $t' >/dev/null; then
+                digest="$(docker image inspect "${b}:${sdk}" --format '{{index .RepoDigests 0}}')"
+                base="${b}:${sdk}@${digest#*@}"
+                break
+              fi
+            done
+          fi
+          echo "base=${base}" >> "$GITHUB_OUTPUT"
+          echo "built on: ${base:-no allowed base}"
+
+      - name: The image's metadata, read from the image itself
+        # What the plugin-metadata attestation carries (DESIGN25, ruling
+        # 269): the declaration and the documentation's texts as the SDK in
+        # the image prints them (`meridian-declaration`, `--documentation`),
+        # the contract version the image's SDK declares (meridian.
+        # SCHEMA_VERSION, what it sends at registration), the version of the
+        # plugin the image has installed; its roles and interface from
+        # [tool.meridian] at the commit built, as `meridian plugin upload`
+        # reads them. Each text's digest is computed here, from the text.
+        run: |
+          echo '{}' > image-metadata.json
+          python3 -I - src/pyproject.toml > pyproject.json <<'PY' || exit 0
+          import json, sys, tomllib
+          p = tomllib.load(open(sys.argv[1], "rb"))
+          project, tool = p.get("project", {}), p.get("tool", {}).get("meridian", {})
+          print(json.dumps({"name": str(project.get("name", "")),
+                            "roles": [str(r) for r in tool.get("roles", [])],
+                            "interface": tool.get("interface", False) is True,
+                            "declaration": str(tool.get("declaration", ""))}))
+          PY
+          name="$(jq -r .name pyproject.json)"; ref="$(jq -r .declaration pyproject.json)"
+          run() { timeout 120 docker run --rm --network none --read-only --tmpfs /tmp \
+                    --cap-drop ALL --security-opt no-new-privileges "$@"; }
+          run --entrypoint meridian-declaration candidate:local "$ref" > declaration.json || echo '{}' > declaration.json
+          run --entrypoint meridian-declaration candidate:local --documentation "$ref" > texts.json || echo '[]' > texts.json
+          run --entrypoint python candidate:local -I -c '
+          import importlib.metadata as m, json, sys, meridian
+          try:
+              version = m.version(sys.argv[1])
+          except m.PackageNotFoundError:
+              version = ""
+          print(json.dumps({"schema_version": str(meridian.SCHEMA_VERSION), "version": version,
+                            "sdk_version": m.version("open-meridian")}))' "$name" > image.json || echo '{}' > image.json
+          python3 -I - . > image-metadata.json <<'PY' || echo '{}' > image-metadata.json
+          import hashlib, json, pathlib, sys
+          w = pathlib.Path(sys.argv[1])
+          def read(name, empty):
+              try:
+                  value = json.loads((w / name).read_text())
+              except (OSError, ValueError):
+                  return empty
+              return value if isinstance(value, type(empty)) else empty
+          py, decl = read("pyproject.json", {}), read("declaration.json", {})
+          texts, img = read("texts.json", []), read("image.json", {})
+          def title(markdown):
+              return next((line[2:].strip() for line in markdown.splitlines() if line.startswith("# ")), "")
+          sections = [t for t in texts if isinstance(t, dict)
+                      and isinstance(t.get("section"), str) and isinstance(t.get("markdown"), str)]
+          print(json.dumps({
+              "metadata": {"name": py.get("name", ""), "version": str(img.get("version", "")),
+                           "roles": py.get("roles", []), "interface": py.get("interface", False),
+                           "sdk_version": str(img.get("sdk_version", "")), "declaration": decl},
+              "schema_version": str(img.get("schema_version", "")),
+              "documentation": [{"name": t["section"], "title": title(t["markdown"]), "text": t["markdown"],
+                                 "digest": "sha256:" + hashlib.sha256(t["markdown"].encode("utf-8")).hexdigest()}
+                                for t in sections],
+          }, sort_keys=True))
+          PY
+          [ "$(stat -c %s image-metadata.json)" -le "${METADATA_CAP_BYTES}" ] || echo '{}' > image-metadata.json
+          jq -c '{name: .metadata.name, version: .metadata.version, roles: .metadata.roles,
+                  contract: .schema_version, sections: [.documentation[]?.name]}' image-metadata.json
 
       - name: Bill of materials, vulnerabilities and secrets (Trivy)
         run: |
@@ -207,11 +347,41 @@ jobs:
           docker run --rm -v "$PWD/rootfs:/scan:ro" "${CLAMAV_IMAGE}" \
             sh -c 'freshclam --quiet; clamscan -r --infected --no-summary /scan' > clamav.txt || true
 
-      - name: The role's conformance suite on the harness
-        # SEAM: the SDK's conformance invocation and its result, v25's SDK.
+      - name: The role's conformance suite, in the image (the SDK's runner)
+        # Ruling 268: each role's suite through the SDK's runner and the
+        # plugin's own tests, run by `meridian plugin check --verified
+        # --run-tests` against the code the image holds -- a layer over it
+        # adds the plugin's [dev] extras, and the run has no network and a
+        # read-only root. It passes when role-suite and tests-pass both do.
         run: |
-          (cd src && meridian plugin conformance --image candidate:local --json) > conformance.json \
-            || echo '{"passed": false, "detail": "the conformance suite did not run"}' > conformance.json
+          echo '{"passed": false, "detail": "the conformance suite did not run"}' > conformance.json
+          mkdir -p testlayer
+          python3 -I -c 'import sys, tomllib; p = tomllib.load(open(sys.argv[1], "rb"));
+          print("\n".join(str(r) for r in p.get("project", {}).get("optional-dependencies", {}).get("dev", [])))' \
+            src/pyproject.toml > testlayer/dev.txt || true
+          grep -qiE '^pytest([^-_a-z0-9]|$)' testlayer/dev.txt || echo pytest >> testlayer/dev.txt
+          user="$(docker image inspect candidate:local --format '{{.Config.User}}')"
+          printf '%s\n' 'FROM candidate:local' 'USER root' \
+            'RUN --mount=type=bind,source=dev.txt,target=/tmp/dev.txt pip install --no-cache-dir -r /tmp/dev.txt' \
+            'ARG RUN_AS=65532' 'USER ${RUN_AS}' > testlayer/Dockerfile
+          DOCKER_BUILDKIT=1 docker build -q --build-arg "RUN_AS=${user:-65532}" -t candidate:test testlayer >/dev/null || exit 0
+          timeout 1200 docker run --rm --network none --read-only --tmpfs /tmp \
+            --cap-drop ALL --security-opt no-new-privileges \
+            -e HOME=/tmp -e PYTHONDONTWRITEBYTECODE=1 \
+            -v "$PWD/src:/w:ro" -v "$HOME/.local/bin/meridian:/usr/local/bin/meridian:ro" -w /w \
+            --entrypoint meridian candidate:test plugin check --verified --run-tests --json \
+            > conformance-run.json || true
+          jq -e 'type == "object"' conformance-run.json >/dev/null 2>&1 || exit 0
+          jq '
+            ([.rules[]? | select(.rule == "role-suite")][0].outcome // "not run") as $suite |
+            ([.rules[]? | select(.rule == "tests-pass")][0].outcome // "not run") as $tests |
+            [.failures[]? | select(.rule == "role-suite" or .rule == "tests-pass") | "\(.rule): \(.found)"] as $why |
+            {passed: ($suite == "passed" and $tests == "passed"),
+             detail: (if $suite == "passed" and $tests == "passed"
+                      then "the role suites and the plugin'"'"'s tests passed in the image (meridian \(.meridian // "?") plugin check --verified --run-tests)"
+                      else "role-suite \($suite), tests-pass \($tests)"
+                        + (if ($why | length) > 0 then ": " + ($why[0:5] | join("; ")) else "" end) end)}
+          ' conformance-run.json > conformance.json
 
       - name: Hand the image and findings to the signing job
         if: always()
@@ -227,10 +397,11 @@ jobs:
             clamav.txt
             check.json
             conformance.json
+            image-metadata.json
 
   sign:
     needs: build
-    if: always()
+    if: ${{ always() && !inputs.smoke_test }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     # The only job that reaches the KMS key or the platform. It runs none of
@@ -324,7 +495,6 @@ jobs:
           DIGEST: ${{ steps.push.outputs.digest }}
         run: |
           image="${IMAGE}@${DIGEST}"
-          [ -s check.json ] || echo '{}' > check.json
           jq -n --arg repo "${REPOSITORY}" --arg commit "${BUILT_COMMIT}" \
             --arg tag "${TAG}" --arg signer "${BUILT_FINGERPRINT}" \
             --arg builder "${GITHUB_REPOSITORY}" \
@@ -336,9 +506,18 @@ jobs:
                 metadata: {invocationId: $run}},
               repository: $repo, commit: $commit, tag: $tag, signer: $signer, builder: $builder}' \
             > provenance.json
-          jq '{metadata: (.metadata // {}), schema_version: (.schema_version // ""),
-               documentation: [(.documentation // [])[] | {name, title, text, digest}]}' \
-            check.json > metadata.json
+          # The image's metadata as the build job read it from the image,
+          # within its cap, and only the predicate's own fields.
+          if [ ! -s image-metadata.json ] \
+             || [ "$(stat -c %s image-metadata.json)" -gt "${METADATA_CAP_BYTES}" ] \
+             || ! jq -e 'type == "object"' image-metadata.json >/dev/null 2>&1; then
+            echo '{}' > image-metadata.json
+          fi
+          jq '{metadata: (.metadata // {} | if type == "object" then . else {} end
+                 | {name, version, roles, interface, sdk_version, declaration}),
+               schema_version: (.schema_version // "" | tostring),
+               documentation: [(.documentation // [])[] | select(type == "object") | {name, title, text, digest}]}' \
+            image-metadata.json > metadata.json
           # cosign's vuln predicate carries the scanner's report as
           # scanner.result (trivy's own cosign-vuln format); a raw Trivy
           # report given as --type vuln is dropped to an empty predicate.
@@ -467,3 +646,142 @@ jobs:
               findings: $findings[0]}' \
           | curl -fsS -X POST -H "Authorization: Bearer ${TOKEN}" \
               -H 'Content-Type: application/json' --data @- "$url"
+
+  # Ruling 271: the signing path proven without a publish. In `signing`, so
+  # its token's subject and workflow ref are the build's and the key's
+  # condition holds unchanged; it pushes nothing beyond its own runner and
+  # never calls the platform (whose intake would refuse it: no build, no
+  # nonce).
+  smoke:
+    if: ${{ inputs.smoke_test }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: signing
+    permissions:
+      contents: read
+      id-token: write   # KMS via WIF, and nothing else
+    env:
+      KMS_KEY: ${{ vars.KMS_KEY }}
+    services:
+      registry:
+        # Distribution serves no referrers API, as ghcr.io does not: cosign
+        # keeps the referrers tag schema, which the intake reads.
+        image: registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+        ports: ["5000:5000"]
+    steps:
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac  # v3
+        with:
+          cosign-release: v2.5.2
+
+      - name: Authenticate to the KMS key (Workload Identity Federation)
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed  # v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.SIGNER_SERVICE_ACCOUNT }}
+
+      - name: A throwaway image, in a registry on this runner
+        # Written through the registry's own API: an OCI manifest naming
+        # this run, no layers and nothing built, so the signing environment
+        # runs no build at all.
+        id: image
+        run: |
+          python3 -I - "localhost:5000" smoke >> "$GITHUB_OUTPUT" <<'PY'
+          import hashlib, json, os, sys, urllib.parse, urllib.request
+          host, name = sys.argv[1:]
+          def blob(data, media):
+              digest = "sha256:" + hashlib.sha256(data).hexdigest()
+              start = urllib.request.Request(f"http://{host}/v2/{name}/blobs/uploads/", method="POST")
+              with urllib.request.urlopen(start, timeout=15) as answer:
+                  location = urllib.parse.urljoin(f"http://{host}/", answer.headers["Location"])
+              sep = "&" if "?" in location else "?"
+              put = urllib.request.Request(f"{location}{sep}digest={digest}", data=data, method="PUT",
+                                           headers={"Content-Type": "application/octet-stream"})
+              urllib.request.urlopen(put, timeout=15).close()
+              return {"mediaType": media, "digest": digest, "size": len(data)}
+          config = json.dumps({"architecture": "amd64", "os": "linux", "rootfs": {"type": "layers", "diff_ids": []},
+                               "config": {"Labels": {"smoke-test": os.environ.get("GITHUB_RUN_ID", "")}}}).encode()
+          manifest = json.dumps({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                                 "config": blob(config, "application/vnd.oci.image.config.v1+json"),
+                                 "layers": []}).encode()
+          put = urllib.request.Request(f"http://{host}/v2/{name}/manifests/run", data=manifest, method="PUT",
+                                       headers={"Content-Type": "application/vnd.oci.image.manifest.v1+json"})
+          urllib.request.urlopen(put, timeout=15).close()
+          print("digest=sha256:" + hashlib.sha256(manifest).hexdigest())
+          PY
+
+      - name: Attested with the platform's KMS key, as a build's metadata is
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          jq -n --arg run "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            '{smoke_test: true, run: $run}' > smoke.json
+          cosign attest --yes --tlog-upload=false --new-bundle-format --allow-insecure-registry \
+            --key "${KMS_KEY}" --type "${METADATA_TYPE}" --predicate smoke.json "localhost:5000/smoke@${DIGEST}"
+
+      - name: Verified as the platform's intake verifies; the public key printed
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          cosign public-key --key "${KMS_KEY}" > platform.pub
+          echo "The platform's public key, the half a CLI release pins:"
+          cat platform.pub
+          # The intake's reading (build_artifacts, registry_signing): the
+          # referrers API or its tag schema, each layer's DSSE envelope bare
+          # or in a Sigstore bundle, the envelope alone trusted, its PAE
+          # verified with ECDSA P-256 over SHA-256.
+          mkdir envelopes
+          python3 -I - "localhost:5000" smoke "${DIGEST}" "${METADATA_TYPE}" envelopes <<'PY'
+          import base64, json, pathlib, re, sys, urllib.error, urllib.request
+          host, name, digest, wanted, out = sys.argv[1:]
+          INDEX = "application/vnd.oci.image.index.v1+json"
+          BUNDLE = re.compile(r"application/vnd\.dev\.sigstore\.bundle(\.v[0-9.]+)?\+json(;.*)?")
+          def get(path, accept):
+              request = urllib.request.Request(f"http://{host}/v2/{name}/{path}", headers={"Accept": accept})
+              with urllib.request.urlopen(request, timeout=15) as answer:
+                  return json.loads(answer.read())
+          try:
+              index = get(f"referrers/{digest}", INDEX)
+          except urllib.error.HTTPError as unserved:
+              if unserved.code not in (404, 405):
+                  raise
+              index = get("manifests/" + digest.replace(":", "-", 1), INDEX)
+          found = 0
+          for manifest in index.get("manifests") or []:
+              body = get(f"manifests/{manifest['digest']}", "application/vnd.oci.image.manifest.v1+json")
+              for layer in body.get("layers") or []:
+                  try:
+                      blob = get(f"blobs/{layer['digest']}", "*/*")
+                  except ValueError:
+                      continue
+                  envelope = blob if "payloadType" in blob else None
+                  inner = blob.get("dsseEnvelope")
+                  if envelope is None and isinstance(inner, dict) and any(
+                          BUNDLE.fullmatch(str(m or "")) for m in (layer.get("mediaType"), blob.get("mediaType"))):
+                      envelope = inner
+                  if envelope is None:
+                      continue
+                  body_bytes = base64.b64decode(envelope["payload"])
+                  statement = json.loads(body_bytes)
+                  algorithm, _, value = digest.partition(":")
+                  if statement.get("predicateType") != wanted or not any(
+                          (s.get("digest") or {}).get(algorithm) == value for s in statement.get("subject") or []):
+                      continue
+                  t = str(envelope["payloadType"]).encode("utf-8")
+                  pae = b"DSSEv1 %d %s %d %s" % (len(t), t, len(body_bytes), body_bytes)
+                  for n, signature in enumerate(envelope.get("signatures") or []):
+                      stem = pathlib.Path(out) / f"{found}-{n}"
+                      stem.with_suffix(".pae").write_bytes(pae)
+                      stem.with_suffix(".sig").write_bytes(base64.b64decode(signature["sig"]))
+                  found += 1
+          print(f"{found} envelope(s) of {wanted} on {digest}")
+          PY
+          verified=0
+          for sig in envelopes/*.sig; do
+            [ -e "$sig" ] || continue
+            if openssl dgst -sha256 -verify platform.pub -signature "$sig" "${sig%.sig}.pae" >/dev/null; then
+              verified=$((verified + 1))
+            fi
+          done
+          [ "$verified" -gt 0 ] || { echo "smoke test FAILED: no envelope verifies with the KMS key's public half"; exit 1; }
+          echo "smoke test OK: ${verified} signature(s) verify with the platform's key, read as the intake reads them"
