@@ -28,7 +28,19 @@
 #   policy as one BuildFinding per check, and hands the platform the digest
 #   and those findings (RecordBuildResults). It is the only job with
 #   id-token: write, and runs in the GitHub environment `signing`, so its
-#   OIDC subject is `repo:open-meridian/plugin-builder:environment:signing`.
+#   OIDC subject is GitHub's immutable form, with the owner's and the
+#   repository's IDs:
+#   `repo:open-meridian@290371739/plugin-builder@1423678364:environment:signing`.
+#
+# Each attestation is a Sigstore bundle (`cosign attest --new-bundle-format`,
+# the format cosign 3 makes the default), pushed as an OCI 1.1 referrer of
+# the image: through the registry's referrers API, or, where a registry has
+# none (ghcr.io answers it 404), in the referrers tag schema `sha256-<hex>`,
+# which cosign keeps. No transparency log: the platform verifies each
+# bundle's DSSE envelope against its own key. Proven with cosign v2.5.2, a
+# throwaway key and local registries of both kinds (meridian-platform v25.3,
+# tests/fixtures/referrers/cosign-2.5.2.json); cosign 2's `attest` has no
+# --registry-referrers-mode (that flag is `sign`'s).
 #
 # DESIGN25's RecordBuildResultsRequest carries the image's digest and the
 # findings alone. The platform reads the rest from the image's referrers by
@@ -43,7 +55,8 @@
 #
 # The KMS key's Workload Identity Federation is pinned to that job: its
 # attribute condition requires
-#   assertion.sub == 'repo:open-meridian/plugin-builder:environment:signing'
+#   assertion.sub ==
+#     'repo:open-meridian@290371739/plugin-builder@1423678364:environment:signing'
 #   && assertion.job_workflow_ref ==
 #      'open-meridian/plugin-builder/.github/workflows/build.yaml@refs/heads/main'
 # and grants roles/cloudkms.signerVerifier on the one key and nothing else.
@@ -240,6 +253,10 @@ jobs:
 
       - name: Install cosign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac  # v3
+        with:
+          # The release `attest --new-bundle-format --key --tlog-upload=false`
+          # was proven with; pinned, so an installer default cannot move it.
+          cosign-release: v2.5.2
 
       - name: Authenticate to the KMS key (Workload Identity Federation)
         uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed  # v2
@@ -284,18 +301,36 @@ jobs:
           jq '{metadata: (.metadata // {}), schema_version: (.schema_version // ""),
                documentation: [(.documentation // [])[] | {name, title, text, digest}]}' \
             check.json > metadata.json
-          # OCI 1.1 referrers of the image, which the platform reads by digest.
-          export COSIGN_EXPERIMENTAL=1
-          cosign attest --yes --tlog-upload=false --registry-referrers-mode=oci-1-1 \
-            --key "${KMS_KEY}" --type slsaprovenance1 --predicate provenance.json "$image"
-          cosign attest --yes --tlog-upload=false --registry-referrers-mode=oci-1-1 \
+          # cosign's vuln predicate carries the scanner's report as
+          # scanner.result (trivy's own cosign-vuln format); a raw Trivy
+          # report given as --type vuln is dropped to an empty predicate.
+          [ -s trivy.json ] || echo '{}' > trivy.json
+          [ -s sbom.spdx.json ] || echo '{}' > sbom.spdx.json
+          jq --arg image "${TRIVY_IMAGE}" '
+            ($image | split("@")[0] | split(":")[1]) as $version |
+            {invocation: {parameters: null, uri: "", event_id: "", "builder.id": ""},
+             scanner: {uri: ("pkg:github/aquasecurity/trivy@" + $version), version: $version,
+               db: {uri: "", version: ""}, result: .},
+             metadata: {scanStartedOn: (.CreatedAt // (now | todate)),
+               scanFinishedOn: (.CreatedAt // (now | todate))}}' trivy.json > vuln.json
+          # Sigstore bundles, each an OCI 1.1 referrer of the image, which the
+          # platform reads by digest. The provenance's type is its URI, so
+          # cosign keeps the predicate as written: `slsaprovenance1` parses it
+          # into SLSA's fields and drops repository, commit, tag and signer.
+          cosign attest --yes --tlog-upload=false --new-bundle-format \
+            --key "${KMS_KEY}" --type "https://slsa.dev/provenance/v1" --predicate provenance.json "$image"
+          cosign attest --yes --tlog-upload=false --new-bundle-format \
             --key "${KMS_KEY}" --type "${METADATA_TYPE}" --predicate metadata.json "$image"
-          cosign attest --yes --tlog-upload=false --registry-referrers-mode=oci-1-1 \
+          cosign attest --yes --tlog-upload=false --new-bundle-format \
             --key "${KMS_KEY}" --type spdxjson --predicate sbom.spdx.json "$image"
-          cosign attest --yes --tlog-upload=false --registry-referrers-mode=oci-1-1 \
-            --key "${KMS_KEY}" --type vuln --predicate trivy.json "$image"
+          cosign attest --yes --tlog-upload=false --new-bundle-format \
+            --key "${KMS_KEY}" --type vuln --predicate vuln.json "$image"
 
+      # From here the steps run even when one above failed (the attestations,
+      # say): the platform then refuses the build, naming what it could not
+      # read, rather than holding the version as building.
       - name: Findings, one per check, under plan Q4's policy
+        if: ${{ !cancelled() }}
         run: |
           [ -s sbom.spdx.json ] || echo '{}' > sbom.spdx.json
           [ -s trivy.json ] || echo '{}' > trivy.json
@@ -368,6 +403,7 @@ jobs:
             ]' > findings.json
 
       - name: Who the platform will see
+        if: ${{ !cancelled() }}
         id: oidc
         run: |
           token="$(curl -fsS -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
@@ -377,6 +413,7 @@ jobs:
           echo "::add-mask::${{ inputs.intake_nonce }}"
 
       - name: Hand the results back (RecordBuildResults)
+        if: ${{ !cancelled() }}
         env:
           TOKEN: ${{ steps.oidc.outputs.token }}
         run: |
