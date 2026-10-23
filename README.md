@@ -17,3 +17,7 @@ gh workflow run build.yaml -R open-meridian/plugin-builder --ref main -f smoke_t
   -f build_id=smoke -f repository=- -f tag=- -f listing=- -f registry=- -f image=- \
   -f intake_url=- -f intake_nonce=- -f base_images=- -f community_licence=-
 ```
+
+## Licence
+
+Apache-2.0. See [LICENSE](LICENSE).
