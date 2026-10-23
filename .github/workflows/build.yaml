@@ -153,9 +153,9 @@ env:
   # which the SDK caps at 256 KiB.
   METADATA_CAP_BYTES: "1048576"
   # The meridian whose rules a plugin is held to, and its x86_64 Linux
-  # binary's SHA-256 (meridian-cli's release v0.1.50).
-  MERIDIAN_VERSION: 0.1.50
-  MERIDIAN_SHA256: 5504790eb152b2eed8b98d918fcbde3f423f2185fdb435186b02ba825c549de7
+  # binary's SHA-256 (meridian-cli's release v0.1.52).
+  MERIDIAN_VERSION: 0.1.52
+  MERIDIAN_SHA256: 774878b5bb02236e36d7868b8b61e89dafc67a85c5f975d817317a5c7e68240b
 
 jobs:
   build:
